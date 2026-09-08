@@ -7,7 +7,7 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from pypdf import PdfReader, PdfWriter
 from docling.document_converter import DocumentConverter
 
-app = FastAPI(title="Meishu Extractor", version="3.1")
+app = FastAPI(title="Meishu Extractor", version="4.0")
 
 # O conversor é carregado uma vez só, quando o serviço sobe.
 converter = DocumentConverter()
@@ -16,11 +16,6 @@ API_KEY = os.environ.get("EXTRACTOR_API_KEY", "")
 
 # Quantas páginas processar por vez.
 PAGINAS_POR_LOTE = int(os.environ.get("PAGINAS_POR_LOTE", "30"))
-
-# Marcadores de página que o n8n sabe interpretar (opcional - se a versão
-# do docling instalada não suportar page_break_placeholder, o serviço
-# continua funcionando normalmente, só sem marcar a página real).
-MARCADOR_PAGEBREAK = "\n\n<<<PAGEBREAK>>>\n\n"
 
 trabalhos = {}
 
@@ -48,18 +43,58 @@ def dividir_pdf_em_lotes(caminho_pdf: str, paginas_por_lote: int):
     return caminhos_lotes, total_paginas
 
 
-def exportar_markdown_com_pagina(resultado, pagina_inicial: int):
-    """
-    Exporta o markdown já com marcadores de página, quando a versão do
-    docling instalada suporta isso. Se não suportar (TypeError), cai
-    de volta pro comportamento simples de sempre - nunca quebra a
-    extração por causa disso.
-    """
+def pagina_do_item(item, pagina_base: int) -> int:
+    """Calcula a pagina absoluta do livro a partir da provenance do item
+    (que so sabe a pagina DENTRO do lote atual) somada ao offset do lote."""
     try:
-        md = resultado.document.export_to_markdown(page_break_placeholder=MARCADOR_PAGEBREAK)
-        return f"<<<PAGE:{pagina_inicial}>>>\n\n{md}"
-    except TypeError:
-        return resultado.document.export_to_markdown()
+        prov = getattr(item, "prov", None)
+        if prov:
+            return pagina_base + (prov[0].page_no - 1)
+    except Exception:
+        pass
+    return pagina_base
+
+
+def exportar_estruturado(resultado, pagina_base: int):
+    """
+    Em vez de exportar Markdown (texto puro, onde titulo/nota/tabela viram
+    so texto sem marcacao, obrigando o n8n a ADIVINHAR o que e cada coisa
+    via regex), exportamos os itens do documento com o LABEL que o proprio
+    modelo do Docling ja identificou: section_header, footnote, table,
+    text, etc. Isso elimina a adivinhacao inteira do lado do n8n.
+    """
+    doc = resultado.document
+    itens = []
+
+    for item, _nivel in doc.iterate_items():
+        tipo_python = type(item).__name__
+
+        if tipo_python == "TableItem":
+            try:
+                df = item.export_to_dataframe(doc=doc)
+                texto_tabela = df.to_markdown(index=False)
+            except Exception:
+                continue
+            if texto_tabela and texto_tabela.strip():
+                itens.append({
+                    "texto": texto_tabela.strip(),
+                    "tipo": "table",
+                    "pagina": pagina_do_item(item, pagina_base),
+                })
+            continue
+
+        texto = getattr(item, "text", None)
+        if not texto or not texto.strip():
+            continue
+
+        label = getattr(item, "label", None)
+        itens.append({
+            "texto": texto.strip(),
+            "tipo": str(label) if label else "text",
+            "pagina": pagina_do_item(item, pagina_base),
+        })
+
+    return itens
 
 
 def processar_em_segundo_plano(job_id: str, caminho_tmp: str, extensao: str):
@@ -73,14 +108,14 @@ def processar_em_segundo_plano(job_id: str, caminho_tmp: str, extensao: str):
         else:
             caminhos_lotes = [caminho_tmp]
 
-        partes_markdown = []
+        todos_itens = []
         pagina_inicial_lote = 1
         for indice, caminho_lote in enumerate(caminhos_lotes):
             trabalhos[job_id]["status"] = "processando"
             trabalhos[job_id]["lote_atual"] = indice + 1
 
             resultado = converter.convert(caminho_lote)
-            partes_markdown.append(exportar_markdown_com_pagina(resultado, pagina_inicial_lote))
+            todos_itens.extend(exportar_estruturado(resultado, pagina_inicial_lote))
 
             if extensao.lower() == ".pdf":
                 pagina_inicial_lote += PAGINAS_POR_LOTE
@@ -91,15 +126,14 @@ def processar_em_segundo_plano(job_id: str, caminho_tmp: str, extensao: str):
                 except OSError:
                     pass
 
-        markdown_final = "\n\n".join(partes_markdown)
         trabalhos[job_id] = {
             **trabalhos[job_id],
             "status": "concluido",
-            "markdown": markdown_final,
+            "itens": todos_itens,
             "erro": None,
         }
     except Exception as erro:
-        trabalhos[job_id] = {**trabalhos[job_id], "status": "erro", "markdown": None, "erro": str(erro)}
+        trabalhos[job_id] = {**trabalhos[job_id], "status": "erro", "itens": None, "erro": str(erro)}
         for caminho_lote in caminhos_lotes:
             if caminho_lote != caminho_tmp:
                 try:
@@ -131,7 +165,7 @@ async def extract(file: UploadFile = File(...), x_api_key: str = Header(None)):
     job_id = str(uuid.uuid4())
     trabalhos[job_id] = {
         "status": "processando",
-        "markdown": None,
+        "itens": None,
         "erro": None,
         "total_paginas": None,
         "total_lotes": None,
