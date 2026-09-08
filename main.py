@@ -7,19 +7,21 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from pypdf import PdfReader, PdfWriter
 from docling.document_converter import DocumentConverter
 
-app = FastAPI(title="Meishu Extractor", version="3.0")
+app = FastAPI(title="Meishu Extractor", version="3.1")
 
 # O conversor é carregado uma vez só, quando o serviço sobe.
 converter = DocumentConverter()
 
 API_KEY = os.environ.get("EXTRACTOR_API_KEY", "")
 
-# Quantas páginas processar por vez. Quanto menor, menos memória no pico —
-# mas mais lento no total (mais idas e vindas). 30 é um ponto de partida
-# razoável; se ainda estourar memória, é só baixar esse número.
+# Quantas páginas processar por vez.
 PAGINAS_POR_LOTE = int(os.environ.get("PAGINAS_POR_LOTE", "30"))
 
-# Armazém simples em memória dos trabalhos em andamento/concluídos.
+# Marcadores de página que o n8n sabe interpretar (opcional - se a versão
+# do docling instalada não suportar page_break_placeholder, o serviço
+# continua funcionando normalmente, só sem marcar a página real).
+MARCADOR_PAGEBREAK = "\n\n<<<PAGEBREAK>>>\n\n"
+
 trabalhos = {}
 
 
@@ -29,11 +31,6 @@ def verificar_chave(x_api_key):
 
 
 def dividir_pdf_em_lotes(caminho_pdf: str, paginas_por_lote: int):
-    """
-    Divide um PDF grande em vários PDFs menores (arquivos temporários),
-    cada um com no máximo `paginas_por_lote` páginas. Devolve a lista de
-    caminhos dos arquivos gerados, na ordem certa.
-    """
     leitor = PdfReader(caminho_pdf)
     total_paginas = len(leitor.pages)
     caminhos_lotes = []
@@ -51,12 +48,23 @@ def dividir_pdf_em_lotes(caminho_pdf: str, paginas_por_lote: int):
     return caminhos_lotes, total_paginas
 
 
+def exportar_markdown_com_pagina(resultado, pagina_inicial: int):
+    """
+    Exporta o markdown já com marcadores de página, quando a versão do
+    docling instalada suporta isso. Se não suportar (TypeError), cai
+    de volta pro comportamento simples de sempre - nunca quebra a
+    extração por causa disso.
+    """
+    try:
+        md = resultado.document.export_to_markdown(page_break_placeholder=MARCADOR_PAGEBREAK)
+        return f"<<<PAGE:{pagina_inicial}>>>\n\n{md}"
+    except TypeError:
+        return resultado.document.export_to_markdown()
+
+
 def processar_em_segundo_plano(job_id: str, caminho_tmp: str, extensao: str):
-    """Roda numa thread separada, pra nao segurar a resposta HTTP."""
     caminhos_lotes = []
     try:
-        # Só PDF é dividido em lotes (DOCX/outros formatos, geralmente
-        # menores, seguem direto para o Docling sem dividir).
         if extensao.lower() == ".pdf":
             trabalhos[job_id]["status"] = "dividindo_paginas"
             caminhos_lotes, total_paginas = dividir_pdf_em_lotes(caminho_tmp, PAGINAS_POR_LOTE)
@@ -66,14 +74,17 @@ def processar_em_segundo_plano(job_id: str, caminho_tmp: str, extensao: str):
             caminhos_lotes = [caminho_tmp]
 
         partes_markdown = []
+        pagina_inicial_lote = 1
         for indice, caminho_lote in enumerate(caminhos_lotes):
             trabalhos[job_id]["status"] = "processando"
             trabalhos[job_id]["lote_atual"] = indice + 1
 
             resultado = converter.convert(caminho_lote)
-            partes_markdown.append(resultado.document.export_to_markdown())
+            partes_markdown.append(exportar_markdown_com_pagina(resultado, pagina_inicial_lote))
 
-            # Libera o arquivo temporário do lote assim que termina de usar.
+            if extensao.lower() == ".pdf":
+                pagina_inicial_lote += PAGINAS_POR_LOTE
+
             if caminho_lote != caminho_tmp:
                 try:
                     os.unlink(caminho_lote)
@@ -109,12 +120,6 @@ def health():
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...), x_api_key: str = Header(None)):
-    """
-    Inicia a extracao em segundo plano e devolve NA HORA um job_id.
-    PDFs grandes sao divididos em lotes de paginas e processados um
-    lote por vez, para manter o uso de memoria estavel mesmo em livros
-    muito grandes. Consulte o andamento em GET /extract/{job_id}.
-    """
     verificar_chave(x_api_key)
 
     sufixo = os.path.splitext(file.filename or "")[1] or ".pdf"
@@ -143,7 +148,6 @@ async def extract(file: UploadFile = File(...), x_api_key: str = Header(None)):
 
 @app.get("/extract/{job_id}")
 def status_extract(job_id: str, x_api_key: str = Header(None)):
-    """Consulta o andamento (ou resultado) de um trabalho iniciado em /extract."""
     verificar_chave(x_api_key)
 
     trabalho = trabalhos.get(job_id)
